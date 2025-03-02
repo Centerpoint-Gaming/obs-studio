@@ -764,8 +764,12 @@ struct gs_duplicator : gs_obj {
 	int idx;
 	long refs;
 	bool updated;
+	HWND displayWindow;
+	gs_swap_chain *displaySwapChain;
 
 	void Start();
+	void CreateDisplayWindow();
+	void PresentFrame();
 
 	inline void Release() { duplicator.Release(); }
 

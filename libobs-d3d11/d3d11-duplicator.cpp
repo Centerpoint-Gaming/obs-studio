@@ -18,6 +18,49 @@
 #include "d3d11-subsystem.hpp"
 #include <unordered_map>
 
+// Window class name for the display window
+#define DISPLAY_WINDOW_CLASS L"OBSDuplicatorWindow"
+
+// Window procedure for the display window
+static LRESULT CALLBACK DisplayWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	switch (message) {
+	case WM_CLOSE:
+		ShowWindow(hwnd, SW_HIDE);
+		return 0;
+	case WM_DESTROY:
+		return 0;
+	case WM_SIZE:
+		// Resize handling is done when presenting the frame
+		return 0;
+	}
+	return DefWindowProc(hwnd, message, wParam, lParam);
+}
+
+// Register the window class
+static bool RegisterDisplayWindowClass()
+{
+	static bool registered = false;
+	if (registered)
+		return true;
+
+	WNDCLASSW wc = {};
+	wc.style = CS_HREDRAW | CS_VREDRAW;
+	wc.lpfnWndProc = DisplayWindowProc;
+	wc.hInstance = GetModuleHandle(NULL);
+	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+	wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+	wc.lpszClassName = DISPLAY_WINDOW_CLASS;
+
+	if (!RegisterClassW(&wc)) {
+		blog(LOG_ERROR, "Failed to register display window class");
+		return false;
+	}
+
+	registered = true;
+	return true;
+}
+
 static inline bool get_monitor(gs_device_t *device, int monitor_idx, IDXGIOutput **dxgiOutput)
 {
 	HRESULT hr;
@@ -70,6 +113,61 @@ void gs_duplicator::Start()
 		if (FAILED(hr))
 			throw HRError("Failed to DuplicateOutput", hr);
 	}
+
+	// Create the display window
+	CreateDisplayWindow();
+}
+
+void gs_duplicator::CreateDisplayWindow()
+{
+	if (!RegisterDisplayWindowClass())
+		return;
+
+	// Get monitor info to determine window size and position
+	DXGI_OUTPUT_DESC outputDesc;
+	ComPtr<IDXGIOutput> output;
+	
+	if (!get_monitor(this->device, this->idx, output.Assign()))
+		return;
+
+	if (FAILED(output->GetDesc(&outputDesc)))
+		return;
+
+	RECT monitorRect = outputDesc.DesktopCoordinates;
+	int width = monitorRect.right - monitorRect.left;
+	int height = monitorRect.bottom - monitorRect.top;
+
+	// Create the window
+	this->displayWindow = CreateWindowW(
+		DISPLAY_WINDOW_CLASS,
+		L"Screen Display",
+		WS_OVERLAPPEDWINDOW,
+		CW_USEDEFAULT, CW_USEDEFAULT,
+		width / 2, height / 2, // Start with half the monitor size
+		NULL, NULL, GetModuleHandle(NULL), NULL);
+
+	if (!this->displayWindow) {
+		blog(LOG_ERROR, "Failed to create display window");
+		return;
+	}
+
+	// Create swap chain for the window
+	struct gs_init_data initData = {};
+	initData.window.hwnd = this->displayWindow;
+	initData.cx = width / 2;
+	initData.cy = height / 2;
+	initData.format = GS_BGRA;
+	initData.zsformat = GS_ZS_NONE;
+	initData.num_backbuffers = 1;
+	
+	try {
+		this->displaySwapChain = new gs_swap_chain(this->device, &initData);
+		ShowWindow(this->displayWindow, SW_SHOW);
+	} catch (const HRError &error) {
+		blog(LOG_ERROR, "Failed to create swap chain: %s (%08lX)", error.str, error.hr);
+		DestroyWindow(this->displayWindow);
+		this->displayWindow = NULL;
+	}
 }
 
 gs_duplicator::gs_duplicator(gs_device_t *device_, int monitor_idx)
@@ -77,7 +175,9 @@ gs_duplicator::gs_duplicator(gs_device_t *device_, int monitor_idx)
 	  texture(nullptr),
 	  idx(monitor_idx),
 	  refs(1),
-	  updated(false)
+	  updated(false),
+	  displayWindow(NULL),
+	  displaySwapChain(nullptr)
 {
 	Start();
 }
@@ -85,6 +185,102 @@ gs_duplicator::gs_duplicator(gs_device_t *device_, int monitor_idx)
 gs_duplicator::~gs_duplicator()
 {
 	delete texture;
+	
+	if (displaySwapChain) {
+		delete displaySwapChain;
+		displaySwapChain = nullptr;
+	}
+	
+	if (displayWindow) {
+		DestroyWindow(displayWindow);
+		displayWindow = NULL;
+	}
+}
+
+// Function to display the captured frame in the window
+void gs_duplicator::PresentFrame()
+{
+	// Validate that we have everything we need
+	if (!this->displayWindow || !this->displaySwapChain || !this->texture || !this->texture->texture) {
+		return;
+	}
+		
+	// Check if the window is visible
+	if (!IsWindowVisible(this->displayWindow)) {
+		return;
+	}
+		
+	// Check if window needs resizing
+	RECT clientRect;
+	GetClientRect(this->displayWindow, &clientRect);
+	uint32_t windowWidth = clientRect.right - clientRect.left;
+	uint32_t windowHeight = clientRect.bottom - clientRect.top;
+	
+	if (windowWidth == 0 || windowHeight == 0) {
+		return; // Skip rendering to 0-sized windows
+	}
+	
+	// Resize the swap chain if necessary
+	if (windowWidth != this->displaySwapChain->target.width || 
+	    windowHeight != this->displaySwapChain->target.height) {
+		try {
+			this->displaySwapChain->Resize(windowWidth, windowHeight, GS_BGRA);
+		} catch (const HRError &error) {
+			blog(LOG_ERROR, "Failed to resize swap chain: %s (%08lX)", error.str, error.hr);
+			return;
+		}
+	}
+		
+	// Store the current swap chain
+	gs_swap_chain *prevSwapChain = this->device->curSwapChain;
+	
+	// Load our swap chain
+	this->device->curSwapChain = this->displaySwapChain;
+	
+	// Set the viewport
+	gs_rect viewport = {};
+	viewport.x = viewport.y = 0;
+	viewport.cx = this->displaySwapChain->target.width;
+	viewport.cy = this->displaySwapChain->target.height;
+	this->device->viewport = viewport;
+
+	// Get the render target view and check if it exists
+	ID3D11RenderTargetView *rtv = this->displaySwapChain->target.renderTarget[0].Get();
+	if (!rtv) {
+		blog(LOG_ERROR, "Missing render target view");
+		this->device->curSwapChain = prevSwapChain;
+		return;
+	}
+	
+	// Clear the render target
+	float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	this->device->context->ClearRenderTargetView(rtv, color);
+	
+	// Set render target
+	this->device->context->OMSetRenderTargets(1, &rtv, nullptr);
+	
+	// Copy the texture to the back buffer using D3D11 context functions
+	D3D11_BOX srcBox = {};
+	srcBox.left = 0;
+	srcBox.top = 0;
+	srcBox.front = 0;
+	srcBox.right = this->texture->width;
+	srcBox.bottom = this->texture->height;
+	srcBox.back = 1;
+	
+	// Use CopySubresourceRegion to copy the texture to the swap chain's back buffer
+	this->device->context->CopySubresourceRegion(
+		this->displaySwapChain->target.texture,
+		0, 0, 0, 0,
+		this->texture->texture,
+		0, &srcBox);
+	
+	// Present the frame
+	UINT interval = this->displaySwapChain->hWaitable ? 1 : 0;
+	this->displaySwapChain->swap->Present(interval, 0);
+	
+	// Restore the original swap chain
+	this->device->curSwapChain = prevSwapChain;
 }
 
 extern "C" {
@@ -253,7 +449,11 @@ EXPORT bool gs_duplicator_update_frame(gs_duplicator_t *d)
 	if (!d->duplicator) {
 		return false;
 	}
-	if (d->updated) {
+	
+	// Check if window still exists first
+	if (d->displayWindow && d->displaySwapChain && d->texture && d->updated) {
+		// Continue presenting existing frame if no new one
+		d->PresentFrame();
 		return true;
 	}
 
@@ -285,6 +485,12 @@ EXPORT bool gs_duplicator_update_frame(gs_duplicator_t *d)
 	copy_texture(d, tex);
 	d->duplicator->ReleaseFrame();
 	d->updated = true;
+	
+	// Display the captured frame in the window if window exists
+	if (d->displayWindow && d->displaySwapChain) {
+		d->PresentFrame();
+	}
+	
 	return true;
 }
 
@@ -301,5 +507,13 @@ EXPORT enum gs_color_space gs_duplicator_get_color_space(gs_duplicator_t *duplic
 EXPORT float gs_duplicator_get_sdr_white_level(gs_duplicator_t *duplicator)
 {
 	return duplicator->sdr_white_nits;
+}
+
+EXPORT void gs_duplicator_show_window(gs_duplicator_t *duplicator, bool show)
+{
+	if (!duplicator || !duplicator->displayWindow)
+		return;
+		
+	ShowWindow(duplicator->displayWindow, show ? SW_SHOW : SW_HIDE);
 }
 }
